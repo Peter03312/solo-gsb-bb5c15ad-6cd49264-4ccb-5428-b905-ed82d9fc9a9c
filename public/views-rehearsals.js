@@ -181,15 +181,32 @@ function renderRehearsalDetail(data, reload) {
         <select name="roleId" class="roleSel"></select>
         <select name="actorId" class="actorSel"></select>
         <button class="btn small">派角/改派</button>
+        <button class="btn small batchCastToggle" type="button">批量派角…</button>
       </form>
+      <div class="batchCastBox" style="margin-top:10px;display:none">
+        <h3 style="margin-bottom:4px">批量派角（至少两条；整批按最终派角校验，任一冲突整批不生效）</h3>
+        <div class="batchCastRows"></div>
+        <div class="flex" style="margin-top:6px">
+          <button class="btn small addCastRow" type="button">加一行</button>
+          <button class="btn small primary batchCastSubmit" type="button">整批提交</button>
+          <button class="btn small batchCastCancel" type="button">收起批量派角</button>
+        </div>
+        <div class="muted">每行选择角色与目标演员（“— 撤派 —”表示取消该角色派角）。重复角色、跨剧角色、无效演员或不足两条会被明确拒绝；
+          整批按最终派角重算全部有效时段的参与者，与其他有效日程或本人不可用时段相撞（端点相接不算）则整批不生效。
+          只有实质变化的派角会更新，未变派角的确认继续有效；已开启的签到快照不变，通知仅为受影响时段生成新批次。</div>
+      </div>
     </div>`);
   const roleSel = castBox.querySelector('.roleSel');
   const actorSel = castBox.querySelector('.actorSel');
+  let playRoles = [];
+  let actors = [];
   Promise.all([
     api('GET', `/api/plays/${rehearsal.playId}`),
     loadActors(),
-  ]).then(([detail, actors]) => {
-    roleSel.innerHTML = detail.roles.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join('');
+  ]).then(([detail, actorList]) => {
+    playRoles = detail.roles;
+    actors = actorList;
+    roleSel.innerHTML = playRoles.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join('');
     actorSel.innerHTML = actors.map((a) => `<option value="${a.id}">${esc(a.displayName)}（@${esc(a.username)}）</option>`).join('');
   });
   castBox.querySelector('.assignForm').addEventListener('submit', async (e) => {
@@ -203,6 +220,63 @@ function renderRehearsalDetail(data, reload) {
       toggleRehearsalDetail(rehearsal.id).catch(() => {});
     } catch (err) { toast(scheduleErr(err), true); }
   });
+
+  // —— 批量派角面板：动态添加“角色 + 目标演员（可撤派）”行，整批一次提交 ——
+  const batchCastBox = castBox.querySelector('.batchCastBox');
+  const batchCastRows = castBox.querySelector('.batchCastRows');
+  const roleOptions = () => playRoles.map((r) => `<option value="${r.id}">${esc(r.name)}（${esc(r.code)}）</option>`).join('');
+  const actorOptions = (curActorId) =>
+    `<option value="">— 撤派（取消派角）—</option>` +
+    actors
+      .map((a) => `<option value="${a.id}"${a.id === curActorId ? ' selected' : ''}>${esc(a.displayName)}（@${esc(a.username)}）</option>`)
+      .join('');
+  function addBatchCastRow(roleId, curActorId) {
+    const tr = el(`
+      <div class="flex bcastRow" style="margin:4px 0">
+        <select class="bcRole" style="max-width:200px">${roleOptions()}</select>
+        <select class="bcActor" style="max-width:220px">${actorOptions(curActorId)}</select>
+        <button class="btn small danger bcDel" type="button">移除</button>
+      </div>`);
+    if (roleId != null) tr.querySelector('.bcRole').value = String(roleId);
+    tr.querySelector('.bcDel').addEventListener('click', () => tr.remove());
+    batchCastRows.appendChild(tr);
+  }
+  castBox.querySelector('.batchCastToggle').addEventListener('click', () => {
+    batchCastBox.style.display = '';
+    if (!batchCastRows.children.length) {
+      // 默认预填两行：当前已派角的前两个角色（目标演员保持当前值，可改可撤）
+      const prefill = cast.slice(0, 2);
+      if (prefill.length) prefill.forEach((c) => addBatchCastRow(c.roleId, c.actorId));
+      else { addBatchCastRow(); addBatchCastRow(); }
+    }
+  });
+  castBox.querySelector('.addCastRow').addEventListener('click', () => addBatchCastRow());
+  castBox.querySelector('.batchCastCancel').addEventListener('click', () => { batchCastBox.style.display = 'none'; });
+  castBox.querySelector('.batchCastSubmit').addEventListener('click', async () => {
+    const batchRows = [...batchCastRows.querySelectorAll('.bcastRow')];
+    if (batchRows.length < 2) {
+      toast('批量派角一次至少提交两条调整（单条请用上方表单）', true);
+      return;
+    }
+    const items = batchRows.map((tr) => {
+      const actorVal = tr.querySelector('.bcActor').value;
+      return {
+        roleId: Number(tr.querySelector('.bcRole').value),
+        actorId: actorVal === '' ? null : Number(actorVal),
+      };
+    });
+    try {
+      const data = await api('POST', `/api/rehearsals/${rehearsal.id}/cast/batch`, { items });
+      const parts = [];
+      const n = (action) => data.changes.filter((c) => c.action === action).length;
+      if (n('assigned')) parts.push(`新派 ${n('assigned')} 条`);
+      if (n('reassigned')) parts.push(`改派 ${n('reassigned')} 条`);
+      if (n('unassigned')) parts.push(`撤派 ${n('unassigned')} 条`);
+      toast(`整批派角已生效：${parts.join('、') || '无实质变化'}；新通知批次 ${data.notifications.length} 个时段`);
+      toggleRehearsalDetail(rehearsal.id).catch(() => {});
+    } catch (err) { toast(scheduleErr(err), true); }
+  });
+
   const rows = castBox.querySelector('.castRows');
   rows.innerHTML = cast.length
     ? `<table><tr><th>角色</th><th>演员</th><th>操作</th></tr>${

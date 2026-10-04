@@ -101,16 +101,7 @@ router.get(
     const myRoles = isDirector ? [] : assignedRoleIds(r.id, req.user.id);
     if (!isDirector && myRoles.length === 0) throw forbidden();
 
-    const cast = db
-      .prepare(
-        `SELECT c.*, ro.name AS role_name, ro.code AS role_code,
-                u.display_name AS actor_name, u.username AS actor_username
-           FROM rehearsal_cast c
-           JOIN roles ro ON ro.id = c.role_id
-           JOIN users u ON u.id = c.actor_id
-          WHERE c.rehearsal_id = ? ORDER BY ro.id`
-      )
-      .all(r.id);
+    const cast = listCastRows(r.id);
 
     let visibleCast = cast;
     if (!isDirector) {
@@ -119,15 +110,7 @@ router.get(
 
     const payload = {
       rehearsal: serializeRehearsal(r),
-      cast: visibleCast.map((c) => ({
-        roleId: c.role_id,
-        roleCode: c.role_code,
-        roleName: c.role_name,
-        actorId: c.actor_id,
-        actorName: c.actor_name,
-        actorUsername: c.actor_username,
-        assignedAt: c.assigned_at,
-      })),
+      cast: visibleCast.map(serializeCastRow),
       pending: rehearsalPending(r, isDirector ? null : req.user.id),
       versionLog: db
         .prepare(
@@ -547,6 +530,152 @@ router.post(
       needsAdjustmentSchedules,
       // 与预演一致的结果：确认保留/重做、日程去向、参与演员与通知接收人变化
       preview,
+    });
+  })
+);
+
+/** 派角行（含角色/演员名称），详情接口与批量派角响应共用 */
+function serializeCastRow(c) {
+  return {
+    roleId: c.role_id,
+    roleCode: c.role_code,
+    roleName: c.role_name,
+    actorId: c.actor_id,
+    actorName: c.actor_name,
+    actorUsername: c.actor_username,
+    assignedAt: c.assigned_at,
+  };
+}
+
+/** 读取排练当前全部派角行（带名称） */
+function listCastRows(rehearsalId) {
+  return db
+    .prepare(
+      `SELECT c.*, ro.name AS role_name, ro.code AS role_code,
+              u.display_name AS actor_name, u.username AS actor_username
+         FROM rehearsal_cast c
+         JOIN roles ro ON ro.id = c.role_id
+         JOIN users u ON u.id = c.actor_id
+        WHERE c.rehearsal_id = ? ORDER BY ro.id`
+    )
+    .all(rehearsalId);
+}
+
+// ---- 导演：同一排练内一次批量派角/改派/撤派（至少两条） ----
+// 按“整批最终派角”判定：重复角色、跨剧角色、无效演员或不足两条一律 400 明确拒绝；
+// 全部有效时段按最终派角重算参与者，与其他有效日程重叠 409 SCHEDULE_CONFLICT、
+// 撞本人不可用时段 409 UNAVAILABILITY_CONFLICT（details.conflicts 结构同现有接口），
+// 任一冲突整批不生效（同一事务回滚）。端点相接允许，已取消与待调整时段不参与。
+// 成功后只更新实质变化的派角；历史确认保留（原演员不再计入，新演员逐场确认），
+// 未变派角的确认继续有效；通知按最终名单只为受影响时段生成必要新批次，签到快照不变。
+router.post(
+  '/rehearsals/:id/cast/batch',
+  wrap((req, res) => {
+    if (req.user.role !== 'director') throw forbidden();
+    const r = getRehearsalOrThrow(req.params.id);
+
+    // —— 批次级入参校验（先于任何写操作）——
+    const items = req.body?.items ?? req.body; // 兼容 {items:[...]} 与裸数组
+    if (!Array.isArray(items)) {
+      throw badRequest('请求体须为 items 数组（每项含 roleId 与目标 actorId，actorId 为空表示撤派）');
+    }
+    if (items.length < 2) {
+      throw badRequest('批量派角一次至少提交两条调整；单条派角/撤派请使用 POST/DELETE /cast');
+    }
+
+    // —— 逐条解析与校验：重复角色、跨剧角色、无效演员全部 400 明确拒绝 ——
+    const seenRoles = new Set();
+    const parsed = [];
+    items.forEach((item, idx) => {
+      const where = `第 ${idx + 1} 条`;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        throw badRequest(`${where}：条目必须是对象`);
+      }
+      const roleId = Number(item.roleId);
+      if (!Number.isInteger(roleId)) throw badRequest(`${where}：roleId 必填且为整数`);
+      if (seenRoles.has(roleId)) throw badRequest(`${where}：批次中存在重复角色 #${roleId}`);
+      seenRoles.add(roleId);
+      const role = db.prepare('SELECT * FROM roles WHERE id = ? AND play_id = ?').get(roleId, r.play_id);
+      if (!role) throw badRequest(`${where}：角色 #${roleId} 不存在或不属于该剧，批量派角仅限同一排练`);
+      // actorId 为 null/空串表示撤派；undefined（缺省）按空处理，数字 0 视为非法
+      const rawActor = item.actorId;
+      if (rawActor === null || rawActor === undefined || (typeof rawActor === 'string' && rawActor.trim() === '')) {
+        parsed.push({ roleId, actorId: null });
+        return;
+      }
+      const actorId = Number(rawActor);
+      if (!Number.isInteger(actorId)) throw badRequest(`${where}：actorId 必须是演员 id（整数），或留空表示撤派`);
+      const actor = db.prepare("SELECT * FROM users WHERE id = ? AND role = 'actor'").get(actorId);
+      if (!actor) throw badRequest(`${where}：演员 #${actorId} 不存在或不是演员`);
+      parsed.push({ roleId, actorId });
+    });
+
+    const beforeRows = listCastRows(r.id);
+    const beforeMap = new Map(beforeRows.map((c) => [c.role_id, c]));
+
+    const result = transaction(() => {
+      // 先按整批最终派角落库（仍在同一事务：后续冲突抛错即整体回滚，整批不生效）
+      const changes = [];
+      const unchanged = [];
+      for (const { roleId, actorId } of parsed) {
+        const existing = beforeMap.get(roleId);
+        if (actorId === null) {
+          if (!existing) {
+            unchanged.push(roleId); // 原本就未派角，撤派为空操作
+            continue;
+          }
+          db.prepare('DELETE FROM rehearsal_cast WHERE rehearsal_id = ? AND role_id = ?').run(r.id, roleId);
+          changes.push({ roleId, action: 'unassigned', fromActorId: existing.actor_id, actorId: null });
+        } else if (existing) {
+          if (existing.actor_id === actorId) {
+            unchanged.push(roleId); // 派角未变：确认继续有效
+            continue;
+          }
+          // 改派：保留原演员的历史确认（待确认计算时不再计入），新演员需逐场重新确认
+          db.prepare("UPDATE rehearsal_cast SET actor_id = ?, assigned_at = datetime('now') WHERE id = ?").run(
+            actorId,
+            existing.id
+          );
+          changes.push({ roleId, action: 'reassigned', fromActorId: existing.actor_id, actorId });
+        } else {
+          db.prepare('INSERT INTO rehearsal_cast (rehearsal_id, role_id, actor_id) VALUES (?, ?, ?)').run(
+            r.id,
+            roleId,
+            actorId
+          );
+          changes.push({ roleId, action: 'assigned', fromActorId: null, actorId });
+        }
+      }
+
+      // 以整批最终派角重算全部有效时段的参与者：批内/跨排练日程重叠与本人不可用时段统一检测，
+      // 端点相接允许，已取消与待调整时段不参与；任一冲突抛 409，整个事务回滚。
+      assertRehearsalSchedulesAfterCastChange(
+        r.id,
+        '批量派角后参与演员与其他未取消时段重叠，本次整批派角未生效',
+        '批量派角后参与演员与其登记的不可用时段相撞，本次整批派角未生效'
+      );
+      // 通知与原操作同事务：仅参与者/角色实质变化的时段按最终名单生成新批次；冲突失败不留批次。
+      const created = syncScheduleNotifications(r.id, 'cast', req.user.id);
+      return { changes, unchanged, notifications: created };
+    });
+
+    const afterMap = new Map(listCastRows(r.id).map((c) => [c.role_id, c]));
+    const nameOf = (id) => db.prepare('SELECT display_name FROM users WHERE id = ?').get(id)?.display_name ?? `#${id}`;
+    res.json({
+      ok: true,
+      cast: listCastRows(r.id).map(serializeCastRow),
+      changes: result.changes.map((x) => ({
+        roleId: x.roleId,
+        roleName: afterMap.get(x.roleId)?.role_name ?? beforeMap.get(x.roleId)?.role_name ?? `#${x.roleId}`,
+        action: x.action, // assigned=新派 / reassigned=改派 / unassigned=撤派
+        fromActorId: x.fromActorId,
+        fromActorName: x.fromActorId == null ? null : nameOf(x.fromActorId),
+        actorId: x.actorId,
+        actorName: x.actorId == null ? null : nameOf(x.actorId),
+      })),
+      unchanged: result.unchanged,
+      notifications: result.notifications,
+      pending: rehearsalPending(getRehearsalOrThrow(r.id), null),
     });
   })
 );

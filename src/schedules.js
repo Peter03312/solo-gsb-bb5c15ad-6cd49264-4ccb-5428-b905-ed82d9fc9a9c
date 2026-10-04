@@ -241,8 +241,16 @@ function assertNoUnavailabilityConflicts(candidates, message) {
   if (conflicts.length) throw conflict('UNAVAILABILITY_CONFLICT', message, { conflicts });
 }
 
-/** 派角/改派后（事务内调用）：整排练的有效时段按新派角重算参与者，冲突则抛 409 回滚 */
-function assertRehearsalSchedulesAfterCastChange(rehearsalId) {
+/**
+ * 派角/改派后（事务内调用）：整排练的有效时段按新派角重算参与者，冲突则抛 409 回滚。
+ * 整批派角在同一事务内把所有变更落库后调用：候选按“整批最终派角”动态推导参与者，
+ * 因此批内互换演员等情形以最终状态判定，端点相接允许、已取消与待调整时段不参与。
+ */
+function assertRehearsalSchedulesAfterCastChange(
+  rehearsalId,
+  scheduleMessage = '派角后参与演员与其他未取消时段重叠，本次派角未生效',
+  unavailabilityMessage = '派角后参与演员与其登记的不可用时段相撞，本次派角未生效'
+) {
   const rehearsal = db.prepare('SELECT * FROM rehearsals WHERE id = ?').get(rehearsalId);
   const rows = db
     .prepare("SELECT * FROM rehearsal_schedules WHERE rehearsal_id = ? AND status = 'active'")
@@ -251,8 +259,8 @@ function assertRehearsalSchedulesAfterCastChange(rehearsalId) {
   const candidates = rows.map((s) =>
     buildCandidate({ scheduleId: s.id, rehearsal, sceneId: s.scene_id, startAt: s.start_at, endAt: s.end_at })
   );
-  assertNoScheduleConflicts(candidates, '派角后参与演员与其他未取消时段重叠，本次派角未生效');
-  assertNoUnavailabilityConflicts(candidates, '派角后参与演员与其登记的不可用时段相撞，本次派角未生效');
+  assertNoScheduleConflicts(candidates, scheduleMessage);
+  assertNoUnavailabilityConflicts(candidates, unavailabilityMessage);
 }
 
 /**
