@@ -7,7 +7,7 @@ const ATT_STATE_LABEL = { checked_in: '已签到', pending: '待签到', absent:
 const ATT_STATE_CLASS = { checked_in: 'done', pending: 'pending', absent: 'abandoned', unmarked: 'abandoned' };
 const NOTIF_STATUS_LABEL = { current: '当前批次', superseded: '已被取代', inactive: '已失效' };
 const NOTIF_STATUS_CLASS = { current: 'open', superseded: 'abandoned', inactive: 'abandoned' };
-const NOTIF_REASON_LABEL = { create: '创建时段', adjust: '调整时段', batch_adjust: '批量调整时段', cast: '派角/撤派', version_switch: '显式换版' };
+const NOTIF_REASON_LABEL = { create: '创建时段', adjust: '调整时段', batch_adjust: '批量调整时段', cast: '派角/撤派', batch_cast: '批量派角', version_switch: '显式换版' };
 const MY_NOTIF_STATE_LABEL = { pending: '待确认', confirmed: '已确认', superseded: '已被新批次取代', inactive: '已失效' };
 const MY_NOTIF_STATE_CLASS = { pending: 'pending', confirmed: 'done', superseded: 'abandoned', inactive: 'abandoned' };
 
@@ -181,16 +181,52 @@ function renderRehearsalDetail(data, reload) {
         <select name="roleId" class="roleSel"></select>
         <select name="actorId" class="actorSel"></select>
         <button class="btn small">派角/改派</button>
+        <button class="btn small openBatchCast" type="button">批量派角调整…</button>
       </form>
+      <div class="batchCastBox" style="margin-top:8px;display:none">
+        <h3 style="margin-bottom:4px">批量派角调整（至少两条；按整批最终派角统一校验，任一冲突整批不生效）</h3>
+        <div class="batchCastRows muted">加载中…</div>
+        <div class="flex" style="margin-top:6px">
+          <button class="btn small primary batchCastSubmit" type="button">整批提交</button>
+          <button class="btn small batchCastCancel" type="button">收起批量派角</button>
+        </div>
+        <div class="muted">勾选至少两个角色并选定目标演员（“— 撤派 / 不派 —”表示取消派角）；与当前相同的条目保持不变。
+          整批按最终派角重算所有有效时段参与者：与其他有效日程或演员不可用时段冲突则整批不生效。</div>
+      </div>
     </div>`);
   const roleSel = castBox.querySelector('.roleSel');
   const actorSel = castBox.querySelector('.actorSel');
+  const batchCastBox = castBox.querySelector('.batchCastBox');
+  const batchCastRows = castBox.querySelector('.batchCastRows');
   Promise.all([
     api('GET', `/api/plays/${rehearsal.playId}`),
     loadActors(),
   ]).then(([detail, actors]) => {
     roleSel.innerHTML = detail.roles.map((r) => `<option value="${r.id}">${esc(r.name)}</option>`).join('');
     actorSel.innerHTML = actors.map((a) => `<option value="${a.id}">${esc(a.displayName)}（@${esc(a.username)}）</option>`).join('');
+    // 批量派角面板：每个角色一行（纳入勾选 + 当前演员 + 目标演员下拉，预填当前派角）
+    const castMap = new Map(cast.map((c) => [c.roleId, c]));
+    batchCastRows.innerHTML = detail.roles.length
+      ? `<table>
+          <tr><th>纳入</th><th>角色</th><th>当前演员</th><th>目标演员</th></tr>
+          ${detail.roles
+            .map((role) => {
+              const cur = castMap.get(role.id);
+              return `<tr data-role="${role.id}">
+                <td><input type="checkbox" class="bcPick" /></td>
+                <td>${esc(role.name)}</td>
+                <td>${cur ? `${esc(cur.actorName)}（@${esc(cur.actorUsername)}）` : '<span class="muted">未派角</span>'}</td>
+                <td><select class="bcActor">
+                  <option value=""${cur ? '' : ' selected'}>— 撤派 / 不派 —</option>
+                  ${actors
+                    .map((a) => `<option value="${a.id}"${cur && cur.actorId === a.id ? ' selected' : ''}>${esc(a.displayName)}（@${esc(a.username)}）</option>`)
+                    .join('')}
+                </select></td>
+              </tr>`;
+            })
+            .join('')}
+        </table>`
+      : '<span class="muted">该剧暂无角色</span>';
   });
   castBox.querySelector('.assignForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -200,6 +236,32 @@ function renderRehearsalDetail(data, reload) {
         actorId: Number(actorSel.value),
       });
       toast('派角已更新（相关确认已重置）');
+      toggleRehearsalDetail(rehearsal.id).catch(() => {});
+    } catch (err) { toast(scheduleErr(err), true); }
+  });
+  // 批量派角：展开/收起面板；整批提交（至少两条，actorId 为空表示撤派）
+  castBox.querySelector('.openBatchCast').addEventListener('click', () => {
+    batchCastBox.style.display = batchCastBox.style.display === 'none' ? '' : 'none';
+  });
+  batchCastBox.querySelector('.batchCastCancel').addEventListener('click', () => {
+    batchCastBox.style.display = 'none';
+  });
+  batchCastBox.querySelector('.batchCastSubmit').addEventListener('click', async () => {
+    const items = [];
+    batchCastRows.querySelectorAll('tr[data-role]').forEach((tr) => {
+      if (!tr.querySelector('.bcPick').checked) return;
+      const v = tr.querySelector('.bcActor').value;
+      items.push({ roleId: Number(tr.dataset.role), actorId: v === '' ? null : Number(v) });
+    });
+    if (items.length < 2) {
+      toast('批量派角一次至少勾选两个角色（单条请用上方“派角/改派”）', true);
+      return;
+    }
+    try {
+      const data = await api('POST', `/api/rehearsals/${rehearsal.id}/cast/batch`, { items });
+      const notif = data.notifications.length ? `；${data.notifications.length} 个时段已生成新通知` : '';
+      const same = data.unchanged.length ? `，${data.unchanged.length} 项无变化` : '';
+      toast(`整批派角已生效：变更 ${data.changed} 项${same}${notif}`);
       toggleRehearsalDetail(rehearsal.id).catch(() => {});
     } catch (err) { toast(scheduleErr(err), true); }
   });

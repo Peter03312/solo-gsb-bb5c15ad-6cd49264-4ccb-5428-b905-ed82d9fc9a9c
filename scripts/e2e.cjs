@@ -949,6 +949,160 @@ async function main() {
   const rhN2View = await G(`/api/rehearsals/${rhN2}`, director);
   check('台词逐场确认不受通知影响', !rhN2View.pending.some((p) => p.actorId === linId && p.sceneId === n1));
 
+  console.log('— 批量派角：入参校验（重复角色/跨剧角色/无效演员/不足两条）—');
+  const rhBC = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '批量派角排练' }, 201)).id;
+  const batchCastUrl = `/api/rehearsals/${rhBC}/cast/batch`;
+  await J(batchCastUrl, lin, { items: [{ roleId: roleA, actorId: linId }, { roleId: roleB, actorId: chenId }] }, 403);
+  await J('/api/rehearsals/99999/cast/batch', director, { items: [{ roleId: roleA, actorId: linId }, { roleId: roleB, actorId: chenId }] }, 404);
+  for (const bad of [undefined, {}, { items: 'x' }, { items: [] }, { items: [{ roleId: roleA, actorId: linId }] }]) {
+    await J(batchCastUrl, director, bad, 400);
+  }
+  check('批量派角：演员 403；排练不存在 404；非数组/空批次/不足两条 400', true);
+  const eDupRole = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: linId }, { roleId: roleA, actorId: chenId },
+  ] }, 400);
+  check('批次内重复角色拒绝', /重复角色/.test(eDupRole.message), eDupRole.message);
+  const eCrossRole = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: linId }, { roleId: keeperRole, actorId: chenId },
+  ] }, 400);
+  check('跨剧角色拒绝', /不属于该剧/.test(eCrossRole.message), eCrossRole.message);
+  const eNoRole = await J(batchCastUrl, director, { items: [
+    { roleId: 99999, actorId: linId }, { roleId: roleB, actorId: chenId },
+  ] }, 400);
+  check('不存在的角色拒绝', /角色 #99999 不存在/.test(eNoRole.message), eNoRole.message);
+  const dirId = (await G('/api/me', director)).user.id;
+  const eBadActor1 = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: 99999 }, { roleId: roleB, actorId: chenId },
+  ] }, 400);
+  const eBadActor2 = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: dirId }, { roleId: roleB, actorId: chenId },
+  ] }, 400);
+  const eBadActor3 = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: 'x' }, { roleId: roleB, actorId: chenId },
+  ] }, 400);
+  check('无效演员（不存在/非演员/非整数）拒绝',
+    /演员 #99999/.test(eBadActor1.message) && /演员/.test(eBadActor2.message) && /actorId/.test(eBadActor3.message),
+    `${eBadActor1.message} | ${eBadActor2.message} | ${eBadActor3.message}`);
+  check('入参校验失败不产生任何派角', (await G(`/api/rehearsals/${rhBC}`, director)).cast.length === 0);
+
+  console.log('— 批量派角：整批生效、只更新变更项、确认规则 —');
+  // 初始：甲=林晚、乙=陈默（单条接口）；林晚确认甲 sc1/sc2，陈默确认乙 sc2
+  await J(`/api/rehearsals/${rhBC}/cast`, director, { roleId: roleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhBC}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  await J(`/api/rehearsals/${rhBC}/confirm`, lin, { roleId: roleA, sceneId: sc1 }, 200);
+  await J(`/api/rehearsals/${rhBC}/confirm`, lin, { roleId: roleA, sceneId: sc2 }, 200);
+  await J(`/api/rehearsals/${rhBC}/confirm`, chen, { roleId: roleB, sceneId: sc2 }, 200);
+  // 有效时段 + 到场登记快照（后续批量派角不得改写）
+  const bcS1 = (await J(`/api/rehearsals/${rhBC}/schedules`, director, { sceneId: sc1, startAt: '2033-01-01T10:00:00+08:00', endAt: '2033-01-01T11:00:00+08:00' }, 201)).schedule;
+  const bcAtt0 = (await J(`/api/rehearsals/${rhBC}/schedules/${bcS1.id}/attendance`, director, {}, 201)).session;
+  await J(`/api/rehearsals/${rhBC}/schedules/${bcS1.id}/attendance/check-in`, lin, {}, 201);
+  // 整批 1：甲维持林晚（unchanged）+ 乙改派周海（reassigned）
+  const bc1 = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: linId }, { roleId: roleB, actorId: zhouId },
+  ] }, 200);
+  check('整批结果逐条返回动作（unchanged/reassigned）',
+    bc1.results.find((x) => x.roleId === roleA).action === 'unchanged'
+    && bc1.results.find((x) => x.roleId === roleB).action === 'reassigned'
+    && bc1.results.find((x) => x.roleId === roleB).fromActorId === chenId
+    && bc1.changed === 1 && bc1.unchanged.includes(roleA), JSON.stringify(bc1.results));
+  check('未变派角的确认继续有效（林晚无待确认）', !bc1.pending.some((p) => p.actorId === linId), JSON.stringify(bc1.pending));
+  const bc1Zhou = bc1.pending.filter((p) => p.actorId === zhouId);
+  check('改派后新演员按逐场确认规则重确（乙 sc1/sc2）', bc1Zhou.length === 2
+    && bc1Zhou.find((p) => p.sceneId === sc2).reason.includes('改派'), JSON.stringify(bc1Zhou));
+  check('原演员历史确认保留但不计入（陈默不在待确认）', !bc1.pending.some((p) => p.actorId === chenId));
+  const bcNotif1 = await G(`/api/rehearsals/${rhBC}/schedules/${bcS1.id}/notifications`, director);
+  // 整批 2：甲改派周海 + 乙撤派（actorId 为空）
+  const bc2 = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: zhouId }, { roleId: roleB, actorId: null },
+  ] }, 200);
+  const bcNotif2 = await G(`/api/rehearsals/${rhBC}/schedules/${bcS1.id}/notifications`, director);
+  check('整批支持改派+撤派混合',
+    bc2.results.find((x) => x.roleId === roleA).action === 'reassigned'
+    && bc2.results.find((x) => x.roleId === roleB).action === 'unassigned'
+    && bc2.changed === 2, JSON.stringify(bc2.results));
+  check('响应含整批最终派角（仅剩甲=周海）', bc2.cast.length === 1 && bc2.cast[0].actorId === zhouId, JSON.stringify(bc2.cast));
+  check('撤派角色不再产生待确认', !bc2.pending.some((p) => p.roleId === roleB));
+  // 整批 3：全部维持现状（actorId 空串同样表示撤派/不派）-> 全部 unchanged
+  const bc3 = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: zhouId }, { roleId: roleB, actorId: '' },
+  ] }, 200);
+  check('无变化批次全部 unchanged 且 changed=0', bc3.changed === 0 && bc3.unchanged.length === 2
+    && bc3.results.every((x) => x.action === 'unchanged'), JSON.stringify(bc3.results));
+
+  console.log('— 批量派角：通知按最终名单仅生成必要新批次、签到快照不变 —');
+  check('整批 1（参与者 林晚+陈默→林晚+周海）生成新批次', bc1.notifications.length === 1
+    && bc1.notifications[0].scheduleId === bcS1.id && bcNotif1.current.seq === 2
+    && bcNotif1.current.recipients.some((r) => r.actorId === zhouId)
+    && bcNotif1.current.recipients.some((r) => r.actorId === linId)
+    && !bcNotif1.current.recipients.some((r) => r.actorId === chenId), JSON.stringify(bcNotif1.current.recipients));
+  check('整批 2（→仅周海）再生成新批次', bc2.notifications.length === 1
+    && bcNotif2.current.seq === 3
+    && bcNotif2.current.recipients.length === 1 && bcNotif2.current.recipients[0].actorId === zhouId);
+  const bcNotif3 = await G(`/api/rehearsals/${rhBC}/schedules/${bcS1.id}/notifications`, director);
+  check('无实质变化的整批不生成新批次', bc3.notifications.length === 0 && bcNotif3.current.seq === 3);
+  const bcAtt1 = (await G(`/api/rehearsals/${rhBC}/schedules/${bcS1.id}/attendance`, director)).session;
+  check('批量派角不改写已开启的签到快照', bcAtt1.roster.length === 2
+    && bcAtt1.roster.some((m) => m.actorId === linId && m.state === 'checked_in')
+    && bcAtt1.startAt === bcAtt0.startAt && bcAtt1.versionId === bcAtt0.versionId, JSON.stringify(bcAtt1.stats));
+
+  console.log('— 批量派角：与其他有效日程重叠 -> 409 SCHEDULE_CONFLICT 整批不生效 —');
+  // RH_BC2：甲=陈默，bcS2 = 2033-02-01 10:00-11:00；rhBC 的 bcS3 = 同日 10:30-11:30（当前参与者仅周海）
+  const rhBC2 = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '批量派角排练2' }, 201)).id;
+  await J(`/api/rehearsals/${rhBC2}/cast`, director, { roleId: roleA, actorId: chenId }, 201);
+  const bcS2 = (await J(`/api/rehearsals/${rhBC2}/schedules`, director, { sceneId: sc1, startAt: '2033-02-01T10:00:00+08:00', endAt: '2033-02-01T11:00:00+08:00' }, 201)).schedule;
+  const bcS3 = (await J(`/api/rehearsals/${rhBC}/schedules`, director, { sceneId: sc1, startAt: '2033-02-01T10:30:00+08:00', endAt: '2033-02-01T11:30:00+08:00' }, 201)).schedule;
+  const bcSeqBefore = (await G(`/api/rehearsals/${rhBC}/schedules/${bcS1.id}/notifications`, director)).current.seq;
+  const eBcSched = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: chenId }, { roleId: roleB, actorId: linId },
+  ] }, 409);
+  check('整批最终派角与其他有效日程重叠 -> 409 且 details.conflicts 指出双方时段',
+    eBcSched.error === 'SCHEDULE_CONFLICT'
+    && eBcSched.details.conflicts.some((c) => c.actorId === chenId && c.schedule.id === bcS3.id && c.overlapsWith.id === bcS2.id),
+    JSON.stringify(eBcSched.details));
+  const bcCastAfter = (await G(`/api/rehearsals/${rhBC}`, director)).cast;
+  check('冲突整批不生效（派角保持原样）', bcCastAfter.length === 1 && bcCastAfter[0].actorId === zhouId);
+  check('冲突失败不留新通知批次', (await G(`/api/rehearsals/${rhBC}/schedules/${bcS1.id}/notifications`, director)).current.seq === bcSeqBefore);
+  // 取消对方时段后同一批次成功（端点相接允许：bcS5 与 bcS1 在 11:00 相接）
+  await J(`/api/rehearsals/${rhBC2}/schedules/${bcS2.id}/cancel`, director, {}, 200);
+  const bc4 = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: linId }, { roleId: roleB, actorId: chenId },
+  ] }, 200);
+  check('冲突解除后整批成功', bc4.changed === 2 && bc4.cast.length === 2);
+
+  console.log('— 批量派角：撞本人不可用时段 -> 409 UNAVAILABILITY_CONFLICT 整批不生效 —');
+  const bcS4 = (await J(`/api/rehearsals/${rhBC}/schedules`, director, { sceneId: sc2, startAt: '2033-03-01T10:30:00+08:00', endAt: '2033-03-01T11:30:00+08:00' }, 201)).schedule;
+  // 周海此时不是任何 2033-03 时段的参与者，可登记不可用
+  const unBC = (await J('/api/me/unavailability', zhou, { startAt: '2033-03-01T09:00:00+08:00', endAt: '2033-03-01T12:00:00+08:00', reason: '批量派角冲突测试' }, 201)).unavailability;
+  const eBcUnav = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: zhouId }, { roleId: roleB, actorId: linId },
+  ] }, 409);
+  check('整批最终派角撞本人不可用 -> 409 且 details.conflicts 含不可用时段',
+    eBcUnav.error === 'UNAVAILABILITY_CONFLICT'
+    && eBcUnav.details.conflicts.some((c) => c.actorId === zhouId && c.schedule.id === bcS4.id && c.unavailability.id === unBC.id),
+    JSON.stringify(eBcUnav.details));
+  const bcCastAfter2 = (await G(`/api/rehearsals/${rhBC}`, director)).cast;
+  check('不可用冲突整批不生效', bcCastAfter2.find((c) => c.roleId === roleA).actorId === linId
+    && bcCastAfter2.find((c) => c.roleId === roleB).actorId === chenId);
+  await D(`/api/me/unavailability/${unBC.id}`, zhou, 200);
+  const bc5 = await J(batchCastUrl, director, { items: [
+    { roleId: roleA, actorId: zhouId }, { roleId: roleB, actorId: linId },
+  ] }, 200);
+  check('撤销不可用后整批成功', bc5.cast.find((c) => c.roleId === roleA).actorId === zhouId);
+
+  console.log('— 批量派角：端点相接允许；原单条接口保持可用 —');
+  // RH_BC3：bcS5 = 2033-01-01 11:00-12:00，与 bcS1（10:00-11:00，参与者周海+林晚）端点相接
+  const rhBC3 = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '批量派角排练3' }, 201)).id;
+  await J(`/api/rehearsals/${rhBC3}/cast`, director, { roleId: roleA, actorId: chenId }, 201);
+  const bcS5 = (await J(`/api/rehearsals/${rhBC3}/schedules`, director, { sceneId: sc1, startAt: '2033-01-01T11:00:00+08:00', endAt: '2033-01-01T12:00:00+08:00' }, 201)).schedule;
+  const bc6 = await J(`/api/rehearsals/${rhBC3}/cast/batch`, director, { items: [
+    { roleId: roleA, actorId: zhouId }, { roleId: roleB, actorId: chenId },
+  ] }, 200);
+  check('端点相接不算冲突（周海 11:00 相接另一时段）', bc6.cast.find((c) => c.roleId === roleA).actorId === zhouId && !!bcS5.id);
+  // 原单条派角/撤派接口语义不变
+  await J(`/api/rehearsals/${rhBC}/cast`, director, { roleId: roleB, actorId: chenId }, 200);
+  await D(`/api/rehearsals/${rhBC}/cast/${roleB}`, director, 200);
+  check('原单条派角/撤派接口保持可用', true);
+
   console.log('— 换版预演：确认/日程/参与者与通知接收人变化、只读 —');
   // RH_P 固定 pv2：甲=林晚、乙=陈默；sc1/sc2 各一段日程；林晚确认 sc1/sc2（甲在两场均有台词）
   const rhP = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv2, name: '预演排练P' }, 201)).id;

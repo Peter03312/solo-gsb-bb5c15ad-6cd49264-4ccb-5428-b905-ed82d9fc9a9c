@@ -31,6 +31,15 @@
 4. 演员只能对**自己获分配角色**的场次确认；角色**改派**后，原演员的历史确认保留但不再计入，新演员需逐场重新确认。
 5. 导演页面和总览页显示每个排练的**待确认演员/角色/场次及原因**，以及最近的发布冲突详情。
 6. 演员的剧本、版本、排练稿接口均只返回其所派角色的台词；越权访问、无效版本/场次会得到明确的 `403/400/404`。
+7. 导演可在排练页**一次批量提交同一排练至少两条派角调整**（`POST /api/rehearsals/:id/cast/batch`）：
+   每项输入**角色**与**目标演员**（`actorId` 为空表示**撤派**），响应给出整批逐条结果；
+   按**整批最终派角**判定——**重复角色、跨剧角色、无效演员或不足两条**一律 `400` 明确拒绝；
+   所有**有效时段**按最终派角重算参与者：与其他有效日程重叠 `409 SCHEDULE_CONFLICT`、
+   撞本人不可用时段 `409 UNAVAILABILITY_CONFLICT`（均沿用 `details.conflicts` 返回详情，**整批不生效**；
+   **端点相接**允许，**已取消和待调整时段不参与**）；
+   成功后**只更新变更的派角**：原演员历史确认保留但不计入，新演员按现有逐场确认规则处理，
+   未变派角的确认继续有效；相关时段通知按最终名单**仅生成必要新批次**，已开启的签到快照不变。
+   原单条派角（`POST /cast`）与撤派（`DELETE /cast/:roleId`）接口及语义保持可用。
 
 ### 换版预演与凭预演提交
 
@@ -110,7 +119,7 @@
 
 ### 时段通知（知悉确认）
 
-1. 有效时段**创建**、**起止/场次调整**（单条或**批量调整**，批量按整批最终状态逐时段比对），以及**派角、撤派、显式换版**导致该时段的参与演员、
+1. 有效时段**创建**、**起止/场次调整**（单条或**批量调整**，批量按整批最终状态逐时段比对），以及**派角、撤派、批量派角、显式换版**导致该时段的参与演员、
    角色或固定版本变化时，系统按**最终结果**为该时段生成新的**通知批次**，冻结：UTC 起止时段、
    场次、固定版本与当时参与演员（含各自角色）；**无实质变化不重复生成**（如同值调整、
    派角未改变参与者）。
@@ -203,7 +212,8 @@ PORT=8080 docker compose up --build -d
   勾选多个修订发布；冲突时页面展示每处冲突的“修订声称原文 vs 现行文本”，并可在发布记录中回看。
 - **导演 → 排练与确认**：创建固定版本的排练、显式换版（可先做**预演换版**：查看确认保留/重做、
   日程继续有效或转待调整、参与演员与通知接收人变化及冲突，再凭预演令牌一键提交；预演后相关状态变化会提示重新预演）、
-  派角/改派，查看待确认清单与冲突；
+  派角/改派（亦可**批量派角调整**：勾选至少两个角色并选定目标演员或撤派，整批按最终派角校验，
+  任一冲突整批不生效，成功后提示变更条数与重发通知的时段数），查看待确认清单与冲突；
   为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；勾选至少两条未取消时段可**批量调整**
   （整批校验冲突，成功后提示有实质变化并重发通知的条数，未变化不重发）；对有效时段**开启/查看/关闭到场登记**
   （名单、缺口、应到/签到/缺席统计）；在“知悉通知”列查看各时段**当前批次的已确认/待确认名单与
@@ -236,6 +246,7 @@ PORT=8080 docker compose up --build -d
 | POST | `/api/rehearsals/:id/switch-version/preview` | 预演换版（导演，只读）：确认保留/重做、日程去向、参与演员与通知接收人变化、冲突；返回 `previewToken` |
 | POST | `/api/rehearsals/:id/switch-version/commit` | 凭预演提交换版（导演）：预演后相关状态变化 `409 PREVIEW_STALE`；冲突整次不生效；成功与预演一致 |
 | POST/DELETE | `/api/rehearsals/:id/cast[/:roleId]` | 派角/改派/取消 |
+| POST | `/api/rehearsals/:id/cast/batch` | 批量派角（导演）：一次提交同一排练至少两条派角调整（`actorId` 为空表示撤派）；按整批最终派角统一校验冲突，任一冲突整批不生效；只更新变更项，仅实质变化的时段重发通知 |
 | GET | `/api/rehearsals/:id/script` | 演员排练稿（仅本人角色） |
 | POST | `/api/rehearsals/:id/confirm` | 演员逐场确认 |
 | POST/GET | `/api/rehearsals/:id/schedules` | 安排时段（导演）/ 日程列表（导演含待补派·待调整·已取消，`?status=` 可过滤；演员仅自己参与的有效时段） |
@@ -430,6 +441,67 @@ curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/batch-adjust \
 #    合法化后状态回到 active，并在 notifications 中各得一批新通知（恢复批自身有冲突同样整批拒绝、保持待调整）。
 ```
 
+## 批量派角接口调用示例（curl）
+
+```bash
+# 1. 导演登录，拿到 token
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'
+# -> {"token":"<TOKEN>",...}
+
+# 2. 一次提交同一排练至少两条派角调整：每项 = 角色 + 目标演员（actorId 为空表示撤派）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/cast/batch \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"items":[
+    {"roleId":1,"actorId":4},
+    {"roleId":2,"actorId":null}
+  ]}'
+# -> 200 {"ok":true,
+#        "results":[
+#          {"roleId":1,"roleName":"守塔人","action":"reassigned",
+#           "actorId":4,"actorName":"周海","fromActorId":2,"fromActorName":"林晚"},
+#          {"roleId":2,"roleName":"船员","action":"unassigned",
+#           "actorId":null,"actorName":null,"fromActorId":3,"fromActorName":"陈默"}],
+#        "changed":2,"unchanged":[],
+#        "cast":[{"roleId":1,"roleName":"守塔人","actorId":4,"actorName":"周海",...}],
+#        "pending":[{"actorId":4,"actorName":"周海","roleName":"守塔人","sceneTitle":"I 风暴前夜",
+#                    "reason":"角色已改派，原演员确认不计入"}, ...],
+#        "notifications":[{"scheduleId":1,"notificationId":3,"seq":2}]}
+#    - action：assigned（新派）/ reassigned（改派）/ unassigned（撤派）/ unchanged（与现状相同，未改动）；
+#      只更新变更的派角，未变派角的确认继续有效。
+#    - pending 为整批生效后的待确认清单：原演员历史确认保留但不计入，新演员需逐场重新确认。
+#    - notifications 仅含参与演员发生实质变化的有效时段（按最终名单生成的新批次）；
+#      已开启的到场登记名单/签到保持开启时快照，不因批量派角改写。
+
+# 3. 明确拒绝的批次（均为 400，任何派角都不会变化）：
+#    - items 缺失/不是数组/少于两条：
+#      {"error":"BAD_REQUEST","message":"批量派角一次至少提交两条派角调整；单条派角请使用 POST /cast，撤派请使用 DELETE /cast/:roleId"}
+#    - 同一批次出现重复角色：      400 "批次中存在重复角色 #1"
+#    - 角色不属于该剧（跨剧）：    400 "角色「…」不属于该剧，批量派角仅限本剧角色"
+#    - 角色不存在：               400 "角色 #999 不存在"
+#    - 演员不存在/不是演员/actorId 非整数：400（actorId 留空表示撤派）
+#    - 演员调用 403；排练不存在 404
+
+# 4. 按“整批最终派角”重算所有有效时段参与者；任一冲突整批不生效：
+#    改派后某演员与其他有效日程重叠 -> 409，两条派角都保持原样
+# -> 409 {"error":"SCHEDULE_CONFLICT",
+#        "message":"批量派角后参与演员与其他未取消时段重叠，本次整批派角未生效",
+#        "details":{"conflicts":[{"actorId":4,"actorName":"周海",
+#          "schedule":{"id":5,"rehearsalId":1,"sceneId":1,"startAt":"...","endAt":"..."},
+#          "overlapsWith":{"id":9,"rehearsalId":3,"sceneId":2,"startAt":"...","endAt":"..."}}]}}
+#    撞本人已登记的不可用时段同理返回 409 UNAVAILABILITY_CONFLICT（conflicts 含
+#    unavailability:{id,startAt,endAt,reason}）；端点相接允许，已取消与待调整时段不参与；
+#    冲突失败不生成任何新通知批次。
+
+# 5. 原单条接口保持可用、语义不变：
+curl -s -X POST http://localhost:3000/api/rehearsals/1/cast \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"roleId":1,"actorId":2}'
+curl -s -X DELETE http://localhost:3000/api/rehearsals/1/cast/2 \
+  -H "Authorization: Bearer <TOKEN>"
+```
+
 ## 到场登记接口调用示例（curl）
 
 ```bash
@@ -599,6 +671,9 @@ curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
 日程时段校验与重叠冲突（含跨时区/端点相接/跨排练）、派角与换版的日程冲突回滚、待调整与已取消可见性、
 批量调整（入参拒绝：重复/跨排练/已取消/无台词/无效时间/空批次；两条互换时间成功；批内/跨排练/不可用冲突整批回滚；
 端点相接；无实质变化不重发通知；保持到场登记快照；待调整随批恢复有效）、
+批量派角（入参拒绝：重复角色/跨剧角色/无效演员/不足两条；改派+撤派混合整批生效且只更新变更项；
+未变派角确认继续有效、原演员历史确认不计入、新演员逐场重确；与其他有效日程/本人不可用冲突整批回滚；
+端点相接允许；仅实质变化时段重发通知；保持到场登记快照；原单条派角/撤派接口保持可用）、
 到场登记（开启冻结名单/缺口、签到幂等、改派换版调日程不回写、关闭记缺席、开放期取消作废与关闭后取消标注、
 导演/演员可见性）、演员不可用时段（登记/修改/撤销与本人可见、UTC 归一化、端点相接、
 已取消与待调整不参与、与本人有效日程重叠整次拒绝、导演排期/调期/派角/换版撞不可用整次不生效、
@@ -622,7 +697,7 @@ src/
   auth.js          登录/会话/鉴权
   plays.js         剧本、场次、角色、台词、版本
   revisions.js     修订与发布（冲突检测核心）
-  rehearsals.js    排练、派角、换版（含预演与凭预演提交）、逐场确认
+  rehearsals.js    排练、派角（单条与批量）、换版（含预演与凭预演提交）、逐场确认
   schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突与不可用时段检测、取消联动登记、
                    时段通知批次生成：随排期/调期/取消/派角/换版事务提交）
   attendance.js    到场登记（开启冻结名单/缺口、本人签到、关闭记缺席、作废与统计）
